@@ -471,12 +471,109 @@ public final class GtkBackend: AppBackend {
         )
     }
 
+    private func getPreferredColorScheme() -> ColorScheme {
+        #if os(Linux)
+            guard
+                let proxy = g_dbus_proxy_new_for_bus_sync(
+                    G_BUS_TYPE_SESSION,
+                    .init(0),
+                    nil,
+                    "org.freedesktop.portal.Desktop",
+                    "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.portal.Settings",
+                    nil,
+                    nil
+                )
+            else { return .light }
+            defer { g_object_unref(proxy) }
+
+            guard
+                let v =
+                    ("('org.freedesktop.appearance', 'color-scheme')".withCString {
+                        g_variant_parse(nil, $0, nil, nil, nil)
+                    })
+            else { return .light }
+            defer { g_variant_unref(v) }
+
+            guard
+                let outerOuter = g_dbus_proxy_call_sync(
+                    proxy,
+                    "Read",
+                    v,
+                    .init(0),
+                    .init(-1),
+                    nil,
+                    nil
+                )
+            else { return .light }
+            defer { g_variant_unref(outerOuter) }
+
+            guard let outer = g_variant_get_child_value(outerOuter, 0) else { return .light }
+            defer { g_variant_unref(outer) }
+
+            guard let inner = g_variant_get_variant(outer) else { return .light }
+            defer { g_variant_unref(inner) }
+
+            guard let final = g_variant_get_variant(inner) else { return .light }
+            defer { g_variant_unref(final) }
+
+            let colorSchemeId = g_variant_get_uint32(final)
+
+            if colorSchemeId == 1 {
+                return .dark
+            } else if colorSchemeId == 2 {
+                return .light
+            }
+
+        #endif
+        // TODO: Implement this stuff for MacOS & Windows
+
+        return .light
+    }
+
     public func computeRootEnvironment(defaultEnvironment: EnvironmentValues) -> EnvironmentValues {
-        defaultEnvironment
+        defaultEnvironment.with(\.colorScheme, getPreferredColorScheme())
     }
 
     public func setRootEnvironmentChangeHandler(to action: @escaping () -> Void) {
-        // TODO: React to theme changes
+        guard
+            let proxy = g_dbus_proxy_new_for_bus_sync(
+                G_BUS_TYPE_SESSION,
+                .init(0),
+                nil,
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+                nil,
+                nil
+            )
+        else { return }
+
+        let handler:
+            @convention(c) (
+                OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+                OpaquePointer?, UnsafeMutableRawPointer?
+            ) -> Void = { _, _, sig, params, data in
+                let namespaceVariant = g_variant_get_child_value(params, 0)
+                defer { g_variant_unref(namespaceVariant) }
+                let keyVariant = g_variant_get_child_value(params, 1)
+                defer { g_variant_unref(keyVariant) }
+
+                guard
+                    String(cString: g_variant_get_string(namespaceVariant, nil))
+                        == "org.freedesktop.appearance",
+                    String(cString: g_variant_get_string(keyVariant, nil)) == "color-scheme"
+                else { return }
+
+                (Unmanaged<AnyObject>.fromOpaque(data!).takeUnretainedValue() as! () -> Void)()
+            }
+
+        g_signal_connect_data(
+            proxy, "g-signal::SettingChanged",
+            unsafeBitCast(handler, to: GCallback.self),
+            Unmanaged.passRetained(action as AnyObject).toOpaque(),
+            nil, .init(0)
+        )
     }
 
     public func computeWindowEnvironment(
